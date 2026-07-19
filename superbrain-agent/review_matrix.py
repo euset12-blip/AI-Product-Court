@@ -297,8 +297,43 @@ def parse_review_response(response: str) -> dict:
 # ── API 调用（复用 superbrain_agent） ─────────────────
 
 def call_deepseek_api(api_key: str, model: str, system_prompt: str, user_prompt: str) -> str:
-    """复用 superbrain_agent 的 DeepSeek API 调用"""
+    """复用 superbrain_agent 的 DeepSeek API 调用（向后兼容）"""
     return sa.call_deepseek_api(api_key, model, system_prompt, user_prompt)
+
+
+def call_deepseek_api_with_stats(api_key: str, model: str, system_prompt: str,
+                                  user_prompt: str, label: str = "") -> tuple[str, dict]:
+    """带统计的 API 调用"""
+    import time
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, base_url=sa.DEEPSEEK_BASE_URL)
+    start = time.time()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.7,
+        max_tokens=2048,
+    )
+    elapsed = time.time() - start
+    usage = response.usage
+    stats = {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+        "elapsed_seconds": elapsed,
+    }
+    sa._usage_tracker.record(
+        label=label,
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        elapsed_seconds=elapsed,
+        model=model,
+    )
+    return response.choices[0].message.content, stats
 
 
 # ── 编排评审 ──────────────────────────────────────────
@@ -308,11 +343,15 @@ def run_single_review(
 ) -> dict:
     """执行单个 Agent 对单个候选的评审"""
     system_prompt, user_prompt = build_review_prompt(agent, candidate, knowledge_sources)
-    raw_response = call_deepseek_api(api_key, "deepseek-chat", system_prompt, user_prompt)
+    raw_response, api_stats = call_deepseek_api_with_stats(
+        api_key, "deepseek-chat", system_prompt, user_prompt,
+        label=f"review:{agent['name']}:{candidate['name'][:30]}"
+    )
     parsed = parse_review_response(raw_response)
     parsed["agent"] = agent["name"]
     parsed["candidate"] = candidate["name"]
     parsed["raw_response"] = raw_response
+    parsed["_stats"] = api_stats
     return parsed
 
 
@@ -680,9 +719,18 @@ def main():
     # 写入输出
     write_review_output(results, args.output)
 
+    # 追加成本统计
+    cost_summary = sa._usage_tracker.format_cost_summary()
+    with open(args.output, "a", encoding="utf-8") as f:
+        f.write("\n---\n\n")
+        f.write(cost_summary)
+        f.write("\n")
+
     print(f"\n{'='*60}")
     print(f"== 评审完成 ==")
     print(f"   API 调用: {total_calls} 次")
+    print(f"   Token 总计: {sa._usage_tracker.summary()['total_tokens']:,}")
+    print(f"   预估成本: ${sa._usage_tracker.summary()['total_cost']:.4f}")
     print(f"   输出: {Path(args.output).resolve()}")
 
 

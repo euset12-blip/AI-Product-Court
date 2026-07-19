@@ -291,11 +291,111 @@ def call_deepseek_api(api_key: str, model: str, system_prompt: str,
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.7,      # 需要一定发散性，但不至于胡编
+        temperature=0.7,
         max_tokens=4096,
     )
 
     return response.choices[0].message.content
+
+
+class UsageTracker:
+    """全局 API 调用统计追踪器"""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def record(self, label: str, prompt_tokens: int, completion_tokens: int,
+               elapsed_seconds: float, model: str = "deepseek-chat"):
+        self.calls.append({
+            "label": label,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "elapsed_seconds": elapsed_seconds,
+            "model": model,
+        })
+
+    def summary(self) -> dict:
+        if not self.calls:
+            return {"total_calls": 0, "total_tokens": 0, "total_time": 0, "total_cost": 0}
+        total_tokens = sum(c["total_tokens"] for c in self.calls)
+        total_time = sum(c["elapsed_seconds"] for c in self.calls)
+        # DeepSeek 当前定价 (2026-07): $0.27/1M input, $1.10/1M output
+        total_input = sum(c["prompt_tokens"] for c in self.calls)
+        total_output = sum(c["completion_tokens"] for c in self.calls)
+        cost = (total_input / 1_000_000 * 0.27) + (total_output / 1_000_000 * 1.10)
+        return {
+            "total_calls": len(self.calls),
+            "total_tokens": total_tokens,
+            "total_input_tokens": total_input,
+            "total_output_tokens": total_output,
+            "total_time": total_time,
+            "total_cost": cost,
+            "avg_time": total_time / len(self.calls),
+            "avg_tokens": total_tokens / len(self.calls),
+        }
+
+    def format_cost_summary(self) -> str:
+        s = self.summary()
+        lines = [
+            "## 运行成本统计",
+            "",
+            "| 指标 | 数值 |",
+            "|------|------|",
+            f"| API 调用次数 | {s['total_calls']} |",
+            f"| 总输入 Token | {s['total_input_tokens']:,} |",
+            f"| 总输出 Token | {s['total_output_tokens']:,} |",
+            f"| 总 Token 消耗 | {s['total_tokens']:,} |",
+            f"| 总耗时 | {s['total_time']:.1f}s ({s['total_time']/60:.1f}min) |",
+            f"| 平均每次耗时 | {s['avg_time']:.1f}s |",
+            f"| 预估成本 (DeepSeek) | ${s['total_cost']:.4f} |",
+            "",
+            f"> 定价基准: DeepSeek Chat API, input $0.27/1M tokens, output $1.10/1M tokens (2026-07)",
+        ]
+        return "\n".join(lines)
+
+
+# 全局单例
+_usage_tracker = UsageTracker()
+
+
+def call_deepseek_api_with_stats(api_key: str, model: str, system_prompt: str,
+                                  user_prompt: str, label: str = "") -> tuple[str, dict]:
+    """调用 DeepSeek API，返回 (文本内容, 使用统计)"""
+    from openai import OpenAI
+    import time
+
+    client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+
+    start = time.time()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.7,
+        max_tokens=4096,
+    )
+    elapsed = time.time() - start
+
+    usage = response.usage
+    stats = {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+        "elapsed_seconds": elapsed,
+    }
+
+    _usage_tracker.record(
+        label=label or "API call",
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        elapsed_seconds=elapsed,
+        model=model,
+    )
+
+    return response.choices[0].message.content, stats
 
 
 def write_output(content: str, output_path: str, metadata: dict):
@@ -429,8 +529,17 @@ def main():
     # ── 5. 调用 API ──
     print(f"\n>> 调用 DeepSeek API (model={args.model})...")
     try:
-        result = call_deepseek_api(api_key, args.model, SYSTEM_PROMPT, user_prompt)
-        print(f"   返回: {len(result)} 字符")
+        result, api_stats = call_deepseek_api_with_stats(
+            api_key, args.model, SYSTEM_PROMPT, user_prompt,
+            label="superbrain-agent generation"
+        )
+        print(f"   返回: {len(result)} 字符 | "
+              f"Token: {api_stats['total_tokens']:,} "
+              f"({api_stats['prompt_tokens']:,} in / {api_stats['completion_tokens']:,} out) | "
+              f"耗时: {api_stats['elapsed_seconds']:.1f}s")
+        cost_estimate = (api_stats['prompt_tokens'] / 1_000_000 * 0.27 +
+                         api_stats['completion_tokens'] / 1_000_000 * 1.10)
+        print(f"   预估成本: ${cost_estimate:.4f}")
     except Exception as e:
         print(f"[ERROR] API 调用失败: {e}")
         sys.exit(1)
@@ -452,6 +561,13 @@ def main():
         "history_used": history_used,
     }
     write_output(result, args.output, metadata)
+
+    # 追加成本统计
+    cost_summary = _usage_tracker.format_cost_summary()
+    with open(args.output, "a", encoding="utf-8") as f:
+        f.write("\n---\n\n")
+        f.write(cost_summary)
+        f.write("\n")
 
     # ── 8. 摘要 ──
     print(f"\n{'='*60}")
