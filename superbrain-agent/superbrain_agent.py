@@ -360,42 +360,94 @@ _usage_tracker = UsageTracker()
 
 
 def call_deepseek_api_with_stats(api_key: str, model: str, system_prompt: str,
-                                  user_prompt: str, label: str = "") -> tuple[str, dict]:
-    """调用 DeepSeek API，返回 (文本内容, 使用统计)"""
+                                  user_prompt: str, label: str = "",
+                                  stream: bool = False) -> tuple[str, dict]:
+    """调用 DeepSeek API，返回 (文本内容, 使用统计)。
+
+    当 stream=True 时，实时打印生成的 token，感知延迟从 35s 降到 ~3s。
+    """
     from openai import OpenAI
     import time
 
     client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
 
     start = time.time()
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.7,
-        max_tokens=4096,
-    )
-    elapsed = time.time() - start
 
-    usage = response.usage
-    stats = {
-        "prompt_tokens": usage.prompt_tokens,
-        "completion_tokens": usage.completion_tokens,
-        "total_tokens": usage.total_tokens,
-        "elapsed_seconds": elapsed,
-    }
+    if stream:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.7,
+            max_tokens=4096,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        collected = []
+        usage_info = None
+        first_token = True
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                token = chunk.choices[0].delta.content
+                collected.append(token)
+                if first_token:
+                    first_token = False
+                    ttft = time.time() - start
+                    print(f" (首token {ttft:.1f}s)", end=" ", flush=True)
+                print(token, end="", flush=True)
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage_info = chunk.usage
+
+        elapsed = time.time() - start
+        content = "".join(collected)
+
+        if usage_info:
+            stats = {
+                "prompt_tokens": usage_info.prompt_tokens,
+                "completion_tokens": usage_info.completion_tokens,
+                "total_tokens": usage_info.total_tokens,
+                "elapsed_seconds": elapsed,
+            }
+        else:
+            # fallback: 估算
+            stats = {
+                "prompt_tokens": len(user_prompt) // 4,
+                "completion_tokens": len(content) // 4,
+                "total_tokens": (len(user_prompt) + len(content)) // 4,
+                "elapsed_seconds": elapsed,
+            }
+    else:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.7,
+            max_tokens=4096,
+        )
+        elapsed = time.time() - start
+        content = response.choices[0].message.content
+        usage = response.usage
+        stats = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+            "elapsed_seconds": elapsed,
+        }
 
     _usage_tracker.record(
         label=label or "API call",
-        prompt_tokens=usage.prompt_tokens,
-        completion_tokens=usage.completion_tokens,
-        elapsed_seconds=elapsed,
+        prompt_tokens=stats["prompt_tokens"],
+        completion_tokens=stats["completion_tokens"],
+        elapsed_seconds=stats["elapsed_seconds"],
         model=model,
     )
 
-    return response.choices[0].message.content, stats
+    return content, stats
 
 
 def write_output(content: str, output_path: str, metadata: dict):
@@ -556,7 +608,8 @@ def main():
     try:
         result, api_stats = call_deepseek_api_with_stats(
             api_key, args.model, SYSTEM_PROMPT, user_prompt,
-            label="superbrain-agent generation"
+            label="superbrain-agent generation",
+            stream=interactive  # 交互模式下实时输出 token
         )
         if interactive:
             print(f"OK ({api_stats['elapsed_seconds']:.1f}s, {api_stats['total_tokens']:,} tokens, ${api_stats['prompt_tokens'] / 1_000_000 * 0.27 + api_stats['completion_tokens'] / 1_000_000 * 1.10:.4f})")
