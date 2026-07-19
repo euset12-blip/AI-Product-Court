@@ -455,8 +455,13 @@ def main():
         "--dry-run", action="store_true",
         help="仅打印 prompt 长度统计，不实际调用 API"
     )
+    parser.add_argument(
+        "--interactive", action="store_true",
+        help="交互模式：逐步打印加载过程、API 等待状态和候选方案"
+    )
 
     args = parser.parse_args()
+    interactive = args.interactive
 
     # ── 1. 获取 API Key ──
     api_key = args.api_key or os.environ.get("DEEPSEEK_API_KEY")
@@ -467,7 +472,10 @@ def main():
         sys.exit(1)
 
     # ── 2. 加载知识源 ──
-    print(">> 加载知识源文件...")
+    if interactive:
+        print("\n  [1/4] 读取知识源文件...")
+    else:
+        print(">> 加载知识源文件...")
     knowledge_dir = Path(args.knowledge_dir)
     sources = {
         "competitors": load_markdown_file(str(knowledge_dir / "competitors.md")),
@@ -477,7 +485,11 @@ def main():
 
     for name, content in sources.items():
         status = "[OK]" if not content.startswith("[文件不存在") else "[WARN]"
-        print(f"   {status} {name}: {len(content)} 字符")
+        if interactive:
+            icon = "OK" if status == "[OK]" else "WARN"
+            print(f"      {icon} {name}.md ({len(content)} 字符)")
+        else:
+            print(f"   {status} {name}: {len(content)} 字符")
 
     # ── 2.5 校验知识源完整性 ──
     source_errors = validate_knowledge_sources(sources)
@@ -496,12 +508,19 @@ def main():
         if log_path.exists():
             decision_log = load_markdown_file(str(log_path))
             history_used = True
-            print(f"   [OK] decision_log: {len(decision_log)} 字符（将用于相似性检查）")
+            if interactive:
+                print(f"      OK decision_log.md ({len(decision_log)} 字符, 将检查历史相似)")
+            else:
+                print(f"   [OK] decision_log: {len(decision_log)} 字符（将用于相似性检查）")
         else:
-            print(f"   [INFO] decision_log.md 不存在，跳过历史检查")
+            if not interactive:
+                print(f"   [INFO] decision_log.md 不存在，跳过历史检查")
 
-    # ── 4. 构建 Prompt ──
-    print("\n>> 构建 Prompt...")
+    if interactive:
+        print("  [2/4] 构建评审 Prompt...", end=" ", flush=True)
+    else:
+        print("\n>> 构建 Prompt...")
+
     user_prompt = build_user_prompt(
         sources["competitors"],
         sources["user_pain"],
@@ -510,13 +529,15 @@ def main():
     )
 
     total_chars = len(SYSTEM_PROMPT) + len(user_prompt)
-    print(f"   System Prompt: {len(SYSTEM_PROMPT)} 字符")
-    print(f"   User Prompt: {len(user_prompt)} 字符")
-    print(f"   总计: {total_chars} 字符 (~{total_chars // 4} tokens)")
+    if interactive:
+        print(f"OK (~{total_chars // 4} tokens)")
+    else:
+        print(f"   System Prompt: {len(SYSTEM_PROMPT)} 字符")
+        print(f"   User Prompt: {len(user_prompt)} 字符")
+        print(f"   总计: {total_chars} 字符 (~{total_chars // 4} tokens)")
 
     if args.dry_run:
         print("\n[DRY-RUN] Dry-run 模式，跳过 API 调用。")
-        # 保存拼接后的完整 prompt 供调试
         debug_path = Path(args.output).parent / "debug_prompt.md"
         debug_path.parent.mkdir(parents=True, exist_ok=True)
         debug_path.write_text(
@@ -527,21 +548,28 @@ def main():
         return
 
     # ── 5. 调用 API ──
-    print(f"\n>> 调用 DeepSeek API (model={args.model})...")
+    if interactive:
+        print("  [3/4] 调用 DeepSeek API...", end=" ", flush=True)
+    else:
+        print(f"\n>> 调用 DeepSeek API (model={args.model})...")
+
     try:
         result, api_stats = call_deepseek_api_with_stats(
             api_key, args.model, SYSTEM_PROMPT, user_prompt,
             label="superbrain-agent generation"
         )
-        print(f"   返回: {len(result)} 字符 | "
-              f"Token: {api_stats['total_tokens']:,} "
-              f"({api_stats['prompt_tokens']:,} in / {api_stats['completion_tokens']:,} out) | "
-              f"耗时: {api_stats['elapsed_seconds']:.1f}s")
-        cost_estimate = (api_stats['prompt_tokens'] / 1_000_000 * 0.27 +
-                         api_stats['completion_tokens'] / 1_000_000 * 1.10)
-        print(f"   预估成本: ${cost_estimate:.4f}")
+        if interactive:
+            print(f"OK ({api_stats['elapsed_seconds']:.1f}s, {api_stats['total_tokens']:,} tokens, ${api_stats['prompt_tokens'] / 1_000_000 * 0.27 + api_stats['completion_tokens'] / 1_000_000 * 1.10:.4f})")
+        else:
+            print(f"   返回: {len(result)} 字符 | "
+                  f"Token: {api_stats['total_tokens']:,} "
+                  f"({api_stats['prompt_tokens']:,} in / {api_stats['completion_tokens']:,} out) | "
+                  f"耗时: {api_stats['elapsed_seconds']:.1f}s")
+            cost_estimate = (api_stats['prompt_tokens'] / 1_000_000 * 0.27 +
+                             api_stats['completion_tokens'] / 1_000_000 * 1.10)
+            print(f"   预估成本: ${cost_estimate:.4f}")
     except Exception as e:
-        print(f"[ERROR] API 调用失败: {e}")
+        print(f"\n[ERROR] API 调用失败: {e}")
         sys.exit(1)
 
     # ── 6. 校验输出格式 ──
@@ -550,6 +578,27 @@ def main():
         print("\n[WARN] 输出格式校验发现问题（仍会写入，请人工复核）：")
         for err in output_errors:
             print(f"   - {err}")
+    else:
+        if not interactive:
+            print("   [OK] 输出格式校验通过")
+
+    # 交互模式：逐步打印候选方案
+    if interactive:
+        print("  [4/4] 生成候选方案:\n")
+        import re as _re
+        cand_sections = _re.findall(
+            r"####\s+(候选[一二三四五六七八九十\d]+[：:][^\n]+)",
+            result
+        )
+        selling_points = _re.findall(
+            r"\*\*核心卖点\*\*[：:]\s*(.+?)(?=\n|$)",
+            result
+        )
+        for i, name in enumerate(cand_sections):
+            sp = selling_points[i] if i < len(selling_points) else "(未提取到卖点)"
+            print(f"    {name}")
+            print(f"      卖点: {sp[:100]}{'...' if len(sp) > 100 else ''}")
+            print()
     else:
         print("   [OK] 输出格式校验通过")
 

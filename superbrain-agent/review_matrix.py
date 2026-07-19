@@ -360,6 +360,7 @@ def run_review_matrix(
     knowledge_sources: dict[str, str],
     decision_log: str | None,
     api_key: str,
+    interactive: bool = False,
 ) -> dict:
     """
     编排全部评审：3 个候选 × 6 个 Agent = 最多 18 次并行 API 调用。
@@ -382,7 +383,11 @@ def run_review_matrix(
     results_per_candidate = []
 
     # 为每个候选做评审
-    for candidate in candidates:
+    for idx, candidate in enumerate(candidates, 1):
+        if interactive:
+            print(f"\n  [{idx}/{len(candidates)}] 评审: {candidate['name'][:60]}")
+            print(f"      启动 6 方 Agent 并行评审...")
+
         reviews = []
         # 并行调用 6 个 Agent
         with ThreadPoolExecutor(max_workers=6) as executor:
@@ -395,6 +400,11 @@ def run_review_matrix(
                 try:
                     review = future.result()
                     reviews.append(review)
+                    if interactive:
+                        icon = {"support": "+", "oppose": "-", "neutral": "~"}.get(review["stance"], "?")
+                        stats = review.get("_stats", {})
+                        time_str = f" {stats.get('elapsed_seconds', 0):.1f}s" if stats else ""
+                        print(f"      [{icon}] {agent_name}: {review['stance']}{time_str}")
                 except Exception as e:
                     reviews.append({
                         "agent": agent_name,
@@ -403,6 +413,8 @@ def run_review_matrix(
                         "reason": f"[评审出错: {str(e)}]",
                         "evidence_source": None,
                     })
+                    if interactive:
+                        print(f"      [!] {agent_name}: ERROR - {e}")
 
         # 历史相似性检查
         history_context = None
@@ -441,6 +453,11 @@ def run_review_matrix(
             "reviews": reviews,
             **aggregate,
         })
+
+        if interactive:
+            verdict_label = VERDICT_LABELS.get(aggregate["verdict"], aggregate["verdict"])
+            hw = " [历史警告]" if aggregate.get("history_warning") else ""
+            print(f"      判定: {verdict_label} (支持{aggregate['support_count']}/反对{aggregate['oppose_count']}/中立{aggregate['neutral_count']}){hw}")
 
     return {
         "candidates": results_per_candidate,
@@ -645,8 +662,11 @@ def main():
                         help="仅解析候选和构建 prompt，不调用 API")
     parser.add_argument("--max-candidates", type=int, default=3,
                         help="最多评审几个候选（默认: 3）")
+    parser.add_argument("--interactive", action="store_true",
+                        help="交互模式：实时显示每个专家的评审进度和意见")
 
     args = parser.parse_args()
+    interactive = args.interactive
 
     api_key = args.api_key or os.environ.get("DEEPSEEK_API_KEY")
     if not api_key and not args.dry_run:
@@ -707,7 +727,7 @@ def main():
     # 执行评审
     total_calls = len(candidates) * 6
     print(f"\n>> 开始评审（{len(candidates)} 候选 × 6 Agent = {total_calls} 次并行 API 调用）...")
-    results = run_review_matrix(candidates, knowledge, decision_log, api_key)
+    results = run_review_matrix(candidates, knowledge, decision_log, api_key, interactive=interactive)
 
     for c in results["candidates"]:
         verdict_label = VERDICT_LABELS.get(c["verdict"], c["verdict"])
