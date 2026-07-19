@@ -30,6 +30,7 @@
 
 import argparse
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -89,6 +90,146 @@ SYSTEM_PROMPT = """你是一个叫"超级智囊"的产品策略 Agent，属于"A
 ### 📋 推荐优先级
 [1-3 排序，简要说明理由]
 """
+
+
+def validate_knowledge_sources(sources: dict[str, str]) -> list[str]:
+    """
+    校验知识源是否完整可用，防止在数据不完整时浪费 API token。
+
+    返回错误信息列表，空列表 = 全部通过。
+
+    检查项：
+      1. 文件是否存在（load_markdown_file 返回了 [文件不存在] 标记）
+      2. 文件内容是否为空（去除空白后无内容）
+    """
+    errors = []
+
+    for name, content in sources.items():
+        # 检查 1: 文件不存在
+        if content.startswith("[文件不存在"):
+            errors.append(f"知识源 [{name}] 文件不存在，请检查 knowledge 目录")
+            continue  # 文件不存在就不检查空了
+
+        # 检查 2: 文件内容为空
+        if not content.strip():
+            errors.append(f"知识源 [{name}] 内容为空，请补充数据后再运行")
+
+    return errors
+
+
+def validate_output(content: str) -> list[str]:
+    """
+    校验 API 返回的候选方案是否包含所有必需字段。
+
+    返回错误信息列表，空列表 = 全部通过。
+
+    必需字段：
+      - 「候选一」「候选二」「候选三」三个候选标题
+      - 每个候选必须包含「核心卖点」「证据支撑」「三维评估」
+      - 三维评估必须包含「用户价值」「市场空白」「技术可行性」
+    """
+    errors = []
+
+    # 检查是否有候选方案章节
+    if "候选一" not in content:
+        errors.append("输出缺失候选方案章节：未找到「候选一」标记")
+        return errors  # 后续检查无意义
+
+    # 逐个检查三个候选
+    for i, candidate_label in enumerate(["候选一", "候选二", "候选三"], 1):
+        if candidate_label not in content:
+            errors.append(f"输出缺失第 {i} 个候选方案：未找到「{candidate_label}」标记")
+            continue
+
+        # 找到该候选的内容区间（到下一个候选或下一个章节为止）
+        candidate_pattern = re.compile(
+            rf"####\s+{candidate_label}[：:].*?(?=####\s+候选|###\s+⚠️|###\s+📋|\Z)",
+            re.DOTALL
+        )
+        match = candidate_pattern.search(content)
+        if not match:
+            errors.append(f"候选 {i}：无法定位内容区块")
+            continue
+
+        candidate_text = match.group()
+
+        # 必需字段检查
+        if "**核心卖点**" not in candidate_text and "核心卖点" not in candidate_text:
+            errors.append(f"候选 {i}：缺失「核心卖点」字段")
+        if "**证据支撑**" not in candidate_text and "证据支撑" not in candidate_text:
+            errors.append(f"候选 {i}：缺失「证据支撑」字段")
+        if "**三维评估**" not in candidate_text and "三维评估" not in candidate_text:
+            errors.append(f"候选 {i}：缺失「三维评估」字段")
+        else:
+            # 三维评估的三个维度
+            for dim in ["用户价值", "市场空白", "技术可行性"]:
+                if dim not in candidate_text:
+                    errors.append(f"候选 {i}：三维评估缺失「{dim}」维度")
+
+    return errors
+
+
+def check_history_overlap(output: str) -> dict:
+    """
+    检查输出中的「历史相似性检查」章节是否包含否决/延迟警告。
+
+    返回:
+      {
+        "has_warning": bool,        # 是否包含历史否决警告
+        "matched_ids": list[str],   # 被引用的历史记录 ID 列表
+      }
+
+    注意：仅匹配 ⚠️ 标记的否决/延迟裁决，不把 BIO-003 这类「通过」
+    裁决当作警告。
+    """
+    result = {"has_warning": False, "matched_ids": []}
+
+    # 找到历史相似性检查章节
+    section_pattern = re.compile(
+        r"###\s*⚠️\s*历史相似性检查.*?(?=###\s*📋|###\s*💡|\Z)",
+        re.DOTALL
+    )
+    section_match = section_pattern.search(output)
+    if not section_match:
+        return result
+
+    section = section_match.group()
+
+    # 检测是否有历史相似警告（⚠️ 标记）
+    has_warning_marker = "⚠️" in section and (
+        "历史相似警告" in section or
+        "历史相似" in section and "警告" in section or
+        "BIO-00" in section
+    )
+
+    if not has_warning_marker:
+        return result
+
+    # 提取被引用的历史记录 ID
+    # 匹配 BIO-001, BIO-002 等
+    bio_ids = re.findall(r"BIO-\d{3}", section)
+    unique_ids = list(set(bio_ids))
+
+    # 如果没有明确的否决/延迟关键词，不算警告（可能是"通过"的引用）
+    # BIO-003 是通过的，不应算警告
+    veto_indicators = ["否决", "延迟", "反对", "不推荐", "风险"]
+    has_veto_context = any(indicator in section for indicator in veto_indicators)
+
+    if unique_ids and has_veto_context:
+        result["has_warning"] = True
+
+    # 即使没有明显否决上下文，只要有 BIO ID 引用且不是纯通过的
+    if unique_ids:
+        # 过滤：如果只有 BIO-003（通过裁决），不视为警告
+        veto_ids = [id for id in unique_ids if id != "BIO-003"]
+        if veto_ids:
+            result["has_warning"] = True
+            result["matched_ids"] = veto_ids
+        else:
+            # 只有 BIO-003，不视为警告
+            result["matched_ids"] = []
+
+    return result
 
 
 def load_markdown_file(filepath: str) -> str:
@@ -238,6 +379,14 @@ def main():
         status = "[OK]" if not content.startswith("[文件不存在") else "[WARN]"
         print(f"   {status} {name}: {len(content)} 字符")
 
+    # ── 2.5 校验知识源完整性 ──
+    source_errors = validate_knowledge_sources(sources)
+    if source_errors:
+        print("\n[ERROR] 知识源校验失败，终止运行（避免浪费 API token）：")
+        for err in source_errors:
+            print(f"   - {err}")
+        sys.exit(1)
+
     # ── 3. 加载历史裁决记录（可选） ──
     decision_log = None
     history_used = False
@@ -286,7 +435,16 @@ def main():
         print(f"[ERROR] API 调用失败: {e}")
         sys.exit(1)
 
-    # ── 6. 写入输出 ──
+    # ── 6. 校验输出格式 ──
+    output_errors = validate_output(result)
+    if output_errors:
+        print("\n[WARN] 输出格式校验发现问题（仍会写入，请人工复核）：")
+        for err in output_errors:
+            print(f"   - {err}")
+    else:
+        print("   [OK] 输出格式校验通过")
+
+    # ── 7. 写入输出 ──
     metadata = {
         "date": datetime.now().isoformat(),
         "model": args.model,
@@ -295,7 +453,7 @@ def main():
     }
     write_output(result, args.output, metadata)
 
-    # ── 7. 摘要 ──
+    # ── 8. 摘要 ──
     print(f"\n{'='*60}")
     print(f"== 运行摘要 ==")
     print(f"   知识源: {len(sources)} 个文件")

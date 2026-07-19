@@ -93,6 +93,34 @@ python superbrain_agent.py [OPTIONS]
 
 这一步演示了 AI Product Court 的核心价值：**不是每次提案都从零开始，而是能检索过去的踩坑记录并主动预警**。
 
+## 测试覆盖
+
+```bash
+# 运行全部单元测试（跳过需要 API Key 的集成测试）
+python -m pytest tests/ -v -m "not integration"
+
+# 运行集成测试（需要 DEEPSEEK_API_KEY 环境变量）
+python -m pytest tests/ -v -m "integration"
+```
+
+| 测试场景 | 测试数 | 覆盖率 |
+|---------|--------|--------|
+| 知识源文件缺失/为空时的处理 | 7 | `validate_knowledge_sources()` 文件不存在、空文件、仅空白字符、多文件同时异常 |
+| 候选输出格式校验 | 7 | `validate_output()` 缺失候选、缺失证据、缺失维度、候选数量不足、真实 output.md 回归 |
+| 历史相似检索是否触发 | 7 | `check_history_overlap()` BIO-001 警告检测、BIO-002 UWB 检测、多重匹配、通过裁决不误报 |
+| 无相似历史不应误报 | 3 | 无关内容零误报、通用词汇不触发、空输入不崩溃 |
+| Prompt 构建 | 4 | 三类源完整性、历史裁决注入、任务指令完整性 |
+| 输出写入 | 2 | 文件创建、元数据注入 |
+| System Prompt / 常量 | 5 | 角色定义、输出格式字段、API 端点 |
+| **集成测试** | 1 | 真实 API 调用 + 完整校验链路 |
+
+### 测试设计原则
+
+- **API 调用全部 mock**：30+ 个单元测试不消耗任何 API token，任意环境秒级跑完
+- **真实 case 做 fixture 数据**：回归测试用的 `output_regression_test.md` 直接作为测试输入，验证实际运行效果
+- **pytest.mark.integration**：唯一需要真实 API 的端到端测试单独标记，日常跑 `-m "not integration"` 跳过
+- **先测试、再实现**：`validate_knowledge_sources` / `validate_output` / `check_history_overlap` 三个函数均为 TDD 方式开发
+
 ## 设计原则
 
 - **不使用向量数据库/RAG**：知识源总计 < 20KB，全量拼入 Prompt Context 即可
