@@ -175,10 +175,13 @@ knowledge/                    history/
 
 | 文件 | 内容 | 数据来源 |
 |------|------|---------|
+| `knowledge/amazon_review_analysis.md` | **原始数据层**：10款eufy产品 × 80条Amazon评论的完整分析报告（含分产品深度拆解、评分分布、关键词统计、9条原文引用） | Amazon.com 真实评论，采集日期 2026-07-18 |
 | `knowledge/competitors.md` | 8款智能门锁竞品（eufy/Aqara/鹿客/Yale/Schlage/August/德施曼/TCL）的定位、卖点、差评 | 品牌官网 + Amazon + 媒体评测 |
-| `knowledge/user_pain.md` | 24条真实用户差评，按4类标签分类（网络/操作/隐私/成本），附正负向统计 | Amazon.com 10款eufy门锁 × 80条真实评论 |
+| `knowledge/user_pain.md` | 29条用户差评，按4类标签分类（网络/操作/隐私/成本），附正负向统计 | 提取自 `amazon_review_analysis.md` |
 | `knowledge/case_studies.md` | 4个消费电子成功/失败案例，含5条可复用决策模式 | Ring/Apple/Nest/Schlage 公开资料 |
 | `history/decision_log.md` | 3条历史裁决记录（掌静脉延迟、UWB否决、电池通过） | AI Product Court 过往评审 |
+
+> `amazon_review_analysis.md` 是知识源体系的原始数据基础。`user_pain.md` 和 `competitors.md` 中的具体条目均提取自此报告。引入这份文件是为了让评委看到完整的数据溯源链——从真实评论 → 分析报告 → 结构化知识源 → AI 推理，每一步都有据可查。
 
 ## 命令行选项
 
